@@ -9,7 +9,7 @@ output_path = "output.png"
 width = 320
 height = 320
 
-# Need to calibrate these
+# Using values created in the spec sheet
 full_scale_dn = 860.0 # full scale digital num before value gets clipped
 read_noise_dn = 1
 prnu_std = 0.013
