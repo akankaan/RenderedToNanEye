@@ -11,12 +11,12 @@ height = 320
 
 # Using values from the spec sheet
 full_scale_dn = 860.0 # full scale digital num before value gets clipped
-read_noise_dn = 1
+read_noise_dn = 0.4
 prnu_std = 0.013
 dsnu_std = 0.84
-row_noise_std = 1
+row_noise_std = 0.2
 
-blur_radius = 0.3
+blur_radius = 0.7
 seed = 42
 
 # Kalibr/OpenCV-style intrinsics in pixels [fu fv pu pv]
@@ -155,7 +155,7 @@ def adc_quantize(signal_dn, full_scale_dn):
 def save_image(out, output_path):
     # Save the result scaled to 8-bit for visualization.
     out_img = Image.fromarray((out * 255).astype(np.uint8), mode="L")
-    out_img = out_img.resize((640, 640), Image.Resampling.NEAREST)
+    out_img = out_img.resize((320, 320), Image.Resampling.BICUBIC)
     out_img.save(output_path)
 
 
