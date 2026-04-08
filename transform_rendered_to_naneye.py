@@ -118,9 +118,17 @@ def convert_to_electrons(gray, full_scale_dn):
     return gray * full_scale_dn
 
 
-def apply_prnu(signal_dn, prnu_std, rng):
+def generate_fixed_pattern_maps(shape, prnu_std, dsnu_std, rng):
+    # Create fixed per-pixel maps that can be reused across frames.
+    prnu_map = rng.normal(0, prnu_std, shape).astype(np.float32)
+    dsnu_map = rng.normal(0, dsnu_std, shape).astype(np.float32)
+    return prnu_map, dsnu_map
+
+
+def apply_prnu(signal_dn, prnu_std, rng, prnu_map=None):
     # Photo Response Non-Uniformity (PRNU) is a multiplicative fixed-pattern.
-    prnu_map = rng.normal(0, prnu_std, signal_dn.shape)
+    if prnu_map is None:
+        prnu_map = rng.normal(0, prnu_std, signal_dn.shape)
     return signal_dn * (1 + prnu_map)
 
 
@@ -130,9 +138,10 @@ def apply_shot_noise(signal_dn, rng):
     return rng.poisson(signal_dn).astype(np.float32)
 
 
-def apply_dark_current(signal_dn, dsnu_std, rng, dark_current_mean=0.0):
+def apply_dark_current(signal_dn, dsnu_std, rng, dark_current_mean=0.0, dsnu_map=None):
     # Add dark current fixed-pattern noise and dark shot noise.
-    dsnu_map = rng.normal(0, dsnu_std, signal_dn.shape)
+    if dsnu_map is None:
+        dsnu_map = rng.normal(0, dsnu_std, signal_dn.shape)
     dark_signal = np.clip(dark_current_mean + dsnu_map, 0, None)
     dark_noise = rng.poisson(dark_signal).astype(np.float32)
     return signal_dn + dark_noise
@@ -179,10 +188,11 @@ def main():
     signal_dn = convert_to_electrons(gray, full_scale_dn)
 
     rng = np.random.default_rng(seed)
+    prnu_map, dsnu_map = generate_fixed_pattern_maps(signal_dn.shape, prnu_std, dsnu_std, rng)
 
-    signal_dn = apply_prnu(signal_dn, prnu_std, rng)
+    signal_dn = apply_prnu(signal_dn, prnu_std, rng, prnu_map=prnu_map)
     signal_dn = apply_shot_noise(signal_dn, rng)
-    signal_dn = apply_dark_current(signal_dn, dsnu_std, rng)
+    signal_dn = apply_dark_current(signal_dn, dsnu_std, rng, dsnu_map=dsnu_map)
     signal_dn = apply_readout_noise(signal_dn, read_noise_dn, row_noise_std, rng)
 
     out = adc_quantize(signal_dn, full_scale_dn)

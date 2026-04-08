@@ -14,7 +14,7 @@ def list_input_images(input_dir: Path):
     )
 
 
-def transform_one_image(input_path: Path, output_path: Path, rng):
+def transform_one_image(input_path: Path, output_path: Path, rng, prnu_map, dsnu_map):
     gray = sim.load_image_linear(str(input_path))
     gray = sim.apply_optics(
         gray,
@@ -33,9 +33,9 @@ def transform_one_image(input_path: Path, output_path: Path, rng):
     )
 
     signal_dn = sim.convert_to_electrons(gray, sim.full_scale_dn)
-    signal_dn = sim.apply_prnu(signal_dn, sim.prnu_std, rng)
+    signal_dn = sim.apply_prnu(signal_dn, sim.prnu_std, rng, prnu_map=prnu_map)
     signal_dn = sim.apply_shot_noise(signal_dn, rng)
-    signal_dn = sim.apply_dark_current(signal_dn, sim.dsnu_std, rng)
+    signal_dn = sim.apply_dark_current(signal_dn, sim.dsnu_std, rng, dsnu_map=dsnu_map)
     signal_dn = sim.apply_readout_noise(signal_dn, sim.read_noise_dn, sim.row_noise_std, rng)
 
     out = sim.adc_quantize(signal_dn, sim.full_scale_dn)
@@ -79,11 +79,17 @@ def main():
         raise RuntimeError(f"No supported image files found in: {args.input_dir}")
 
     rng = np.random.default_rng(args.seed)
+    prnu_map, dsnu_map = sim.generate_fixed_pattern_maps(
+        (sim.height, sim.width),
+        sim.prnu_std,
+        sim.dsnu_std,
+        rng,
+    )
     total = len(image_paths)
 
     for idx, image_path in enumerate(image_paths, start=1):
         output_path = args.output_dir / image_path.name
-        transform_one_image(image_path, output_path, rng)
+        transform_one_image(image_path, output_path, rng, prnu_map, dsnu_map)
         print(f"[{idx}/{total}] {image_path.name} -> {output_path}")
 
     print(f"Finished. Wrote {total} transformed images to {args.output_dir}")
