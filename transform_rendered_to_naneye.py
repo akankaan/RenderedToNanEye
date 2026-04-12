@@ -1,3 +1,4 @@
+import argparse
 import numpy as np
 from PIL import Image, ImageFilter
 
@@ -134,6 +135,7 @@ def apply_prnu(signal_dn, prnu_std, rng, prnu_map=None):
 
 def apply_shot_noise(signal_dn, rng):
     # Photon shot noise is described by the Poisson process.
+    # It's caused by the discrete arrival of photons and is signal dependent
     signal_dn = np.clip(signal_dn, 0, None)
     return rng.poisson(signal_dn).astype(np.float32)
 
@@ -146,12 +148,81 @@ def apply_dark_current(signal_dn, dsnu_std, rng, dark_current_mean=0.0, dsnu_map
     dark_noise = rng.poisson(dark_signal).astype(np.float32)
     return signal_dn + dark_noise
 
-
+# Signal independent and is caused by electronics components
 def apply_readout_noise(signal_dn, read_noise_dn, row_noise_std, rng):
     # Read noise and row noise are added after charge-to-voltage conversion.
     noisy = signal_dn + rng.normal(0, read_noise_dn, signal_dn.shape)
     noisy += rng.normal(0, row_noise_std, (signal_dn.shape[0], 1))
     return noisy
+
+
+def load_master_npy(path):
+    return np.load(path).astype(np.float32)
+
+
+def infer_storage_white_level(observed_max):
+    # Assume typical ADC/container white levels for calibration masters.
+    white_levels = (255.0, 1023.0, 4095.0, 16383.0, 65535.0)
+    for white_level in white_levels:
+        if observed_max <= white_level * 1.05:
+            return white_level
+    return observed_max
+
+
+def looks_like_normalized_flat(master_flat):
+    # A normalized flat gain map should be near unit scale and strictly non-negative.
+    flat_mean = float(np.mean(master_flat))
+    flat_min = float(np.min(master_flat))
+    flat_max = float(np.max(master_flat))
+    return 0.2 <= flat_mean <= 5.0 and flat_min >= 0.0 and flat_max <= 10.0
+
+
+def maybe_rescale_master_maps(master_flat, master_dark, full_scale_dn, scale_flat):
+    # Bring calibration maps into the simulator DN scale when masters were exported
+    # from high-bit-depth image containers (for example 16-bit PNG workflows).
+    maps_for_scale_detection = []
+    if scale_flat and master_flat is not None:
+        maps_for_scale_detection.append(master_flat)
+    if master_dark is not None:
+        maps_for_scale_detection.append(master_dark)
+
+    if not maps_for_scale_detection:
+        return master_flat, master_dark, 1.0, None
+
+    observed_max = max(float(np.max(m)) for m in maps_for_scale_detection)
+    if observed_max <= full_scale_dn * 1.5:
+        return master_flat, master_dark, 1.0, None
+
+    source_white_level = infer_storage_white_level(observed_max)
+    scale = full_scale_dn / source_white_level
+
+    if scale_flat and master_flat is not None:
+        master_flat = (master_flat * scale).astype(np.float32)
+    if master_dark is not None:
+        master_dark = (master_dark * scale).astype(np.float32)
+
+    return master_flat, master_dark, scale, source_white_level
+
+
+def validate_master_shape(master_map, expected_shape, label):
+    if master_map is None:
+        return
+    if master_map.shape != expected_shape:
+        raise ValueError(
+            f"{label} shape {master_map.shape} does not match expected sensor shape {expected_shape}."
+        )
+
+
+def apply_master_flat(signal_dn, master_flat, master_dark=None):
+    # Master flat and dark were acquired with the same exposure.
+    # Subtract the dark bias from the flat, normalize the gain, then apply.
+    flat_gain = master_flat
+    if master_dark is not None:
+        flat_gain = master_flat - master_dark
+
+    flat_gain = np.clip(flat_gain, 1e-6, None)
+    flat_gain /= np.mean(flat_gain)
+    return signal_dn * flat_gain
 
 
 def adc_quantize(signal_dn, full_scale_dn):
@@ -168,8 +239,21 @@ def save_image(out, output_path):
     out_img.save(output_path)
 
 
+def parse_arguments():
+    parser = argparse.ArgumentParser(
+        description="Transform a rendered image to NanEye style, optionally using master flat/dark calibration files."
+    )
+    parser.add_argument("--input", type=str, default=input_path, help="Rendered input image path.")
+    parser.add_argument("--output", type=str, default=output_path, help="Output image path.")
+    parser.add_argument("--master-flat", type=str, help="Master flat .npy file.")
+    parser.add_argument("--master-dark", type=str, help="Master dark .npy file.")
+    return parser.parse_args()
+
+
 def main():
-    gray = load_image_linear(input_path)
+    args = parse_arguments()
+
+    gray = load_image_linear(args.input)
     gray = apply_optics(
         gray,
         width,
@@ -187,18 +271,60 @@ def main():
     )
     signal_dn = convert_to_electrons(gray, full_scale_dn)
 
-    rng = np.random.default_rng(seed)
-    prnu_map, dsnu_map = generate_fixed_pattern_maps(signal_dn.shape, prnu_std, dsnu_std, rng)
+    master_flat = load_master_npy(args.master_flat) if args.master_flat else None
+    master_dark = load_master_npy(args.master_dark) if args.master_dark else None
+    expected_shape = signal_dn.shape
+    validate_master_shape(master_flat, expected_shape, "Master flat")
+    validate_master_shape(master_dark, expected_shape, "Master dark")
 
-    signal_dn = apply_prnu(signal_dn, prnu_std, rng, prnu_map=prnu_map)
+    rng = np.random.default_rng(seed)
+
+    has_master_flat = master_flat is not None
+    has_master_dark = master_dark is not None
+    flat_is_normalized = has_master_flat and looks_like_normalized_flat(master_flat)
+
+    if has_master_flat or has_master_dark:
+        master_flat, master_dark, scale, source_white = maybe_rescale_master_maps(
+            master_flat,
+            master_dark,
+            full_scale_dn=full_scale_dn,
+            scale_flat=not flat_is_normalized,
+        )
+        if scale != 1.0:
+            print(
+                "Info: scaled master calibration maps by "
+                f"{scale:.6f} to match full_scale_dn={full_scale_dn:.1f} "
+                f"(assumed source white level {source_white:.0f} DN)."
+            )
+
+    if has_master_flat:
+        if flat_is_normalized and has_master_dark:
+            print(
+                "Info: master flat looks normalized; using it directly as gain "
+                "and skipping (master_flat - master_dark)."
+            )
+            signal_dn = apply_master_flat(signal_dn, master_flat, master_dark=None)
+        elif has_master_dark:
+            signal_dn = apply_master_flat(signal_dn, master_flat, master_dark=master_dark)
+        else:
+            signal_dn = apply_master_flat(signal_dn, master_flat, master_dark=None)
+
+    else:
+        signal_dn = apply_prnu(signal_dn, prnu_std, rng)
+
+    if has_master_dark:
+        signal_dn += master_dark
+    else:
+        signal_dn = apply_dark_current(signal_dn, dsnu_std, rng)
+
     signal_dn = apply_shot_noise(signal_dn, rng)
-    signal_dn = apply_dark_current(signal_dn, dsnu_std, rng, dsnu_map=dsnu_map)
+
     signal_dn = apply_readout_noise(signal_dn, read_noise_dn, row_noise_std, rng)
 
     out = adc_quantize(signal_dn, full_scale_dn)
-    save_image(out, output_path)
+    save_image(out, args.output)
 
-    print("Saved to:", output_path)
+    print("Saved to:", args.output)
 
 
 if __name__ == "__main__":
