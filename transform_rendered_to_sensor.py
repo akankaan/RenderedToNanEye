@@ -260,12 +260,15 @@ def transform_render(
     else:
         signal_dn = apply_prnu(signal_dn, prnu_std, rng, prnu_map=prnu_map)
 
+    # Shot noise is photon noise, so it only applies to the signal
+    # before the dark is added
+    signal_dn = apply_shot_noise(signal_dn, rng)
+
     if master_dark is not None:
         signal_dn = signal_dn + master_dark
     else:
         signal_dn = apply_dark_current(signal_dn, dsnu_std, rng, dsnu_map=dsnu_map)
 
-    signal_dn = apply_shot_noise(signal_dn, rng)
     signal_dn = apply_readout_noise(
         signal_dn, profile.read_noise_dn, profile.row_noise_std, rng
     )
@@ -330,7 +333,6 @@ def main():
     )
     save_image(out, args.output)
     print(f"Saved to: {args.output}  (profile: {profile.name})")
-
 
 if __name__ == "__main__":
     main()
