@@ -1,7 +1,7 @@
 """Turn a rendered image into a sensor-style image
 
 Optics stage (blur, resample, Brown-Conrady distortion) followed by a photometric
-sensor stage that uses master flat and dark frames made by make_masters.py
+sensor stage that uses a sensitivity map and master dark made by make_masters.py
 
 """
 import argparse
@@ -188,12 +188,12 @@ def apply_readout_noise(signal_dn, read_noise_dn, row_noise_std, rng):
     return noisy
 
 
-def apply_master_flat(signal_dn, master_flat):
-    # Scales to peak intensity so applying the gain attenuates and not increases intensity 
+def apply_sensitivity_map(signal_dn, sensitivity_map):
+    # Scales to peak intensity so applying the gain attenuates and not increases intensity
     # in the centre
-    flat_gain = np.clip(master_flat, 1e-6, None)
-    peak = float(np.percentile(flat_gain, PEAK_PERCENTILE))
-    return signal_dn * (flat_gain / max(peak, 1e-6))
+    gain = np.clip(sensitivity_map, 1e-6, None)
+    peak = float(np.percentile(gain, PEAK_PERCENTILE))
+    return signal_dn * (gain / max(peak, 1e-6))
 
 
 def adc_quantize(signal_dn, full_scale_dn):
@@ -210,23 +210,23 @@ def load_master_npy(path):
     return np.load(path).astype(np.float32)
 
 
-def load_masters(profile, flat_path=None, dark_path=None):
-    """Load and sanity-check masters. They must come from make_masters.py."""
-    master_flat = load_master_npy(flat_path) if flat_path else None
+def load_calibration(profile, sensitivity_path=None, dark_path=None):
+    """Load and sanity-check calibration maps. They must come from make_masters.py."""
+    sensitivity_map = load_master_npy(sensitivity_path) if sensitivity_path else None
     master_dark = load_master_npy(dark_path) if dark_path else None
 
-    for label, arr in (("Master flat", master_flat), ("Master dark", master_dark)):
+    for label, arr in (("Sensitivity map", sensitivity_map), ("Master dark", master_dark)):
         if arr is not None and arr.shape != profile.shape:
             raise ValueError(
                 f"{label} shape {arr.shape} does not match the profile's "
                 f"sensor shape {profile.shape}."
             )
 
-    if master_flat is not None:
-        peak = float(np.percentile(master_flat, PEAK_PERCENTILE))
+    if sensitivity_map is not None:
+        peak = float(np.percentile(sensitivity_map, PEAK_PERCENTILE))
         if not 0.5 <= peak <= 2.0:
             raise ValueError(
-                f"Master flat does not look peak-normalized (p{PEAK_PERCENTILE} = {peak:.3g}, "
+                f"Sensitivity map does not look peak-normalized (p{PEAK_PERCENTILE} = {peak:.3g}, "
                 "expected about 1.0). Rebuild it with make_masters.py."
             )
 
@@ -237,14 +237,14 @@ def load_masters(profile, flat_path=None, dark_path=None):
             "Rebuild it with make_masters.py."
         )
 
-    return master_flat, master_dark
+    return sensitivity_map, master_dark
 
 
 def transform_render(
     input_path,
     profile,
     rng,
-    master_flat=None,
+    sensitivity_map=None,
     master_dark=None,
     prnu_std=None,
     dsnu_std=None,
@@ -255,8 +255,8 @@ def transform_render(
     gray = apply_optics(load_image_linear(input_path), profile)
     signal_dn = convert_to_dn(gray, profile.full_scale_dn)
 
-    if master_flat is not None:
-        signal_dn = apply_master_flat(signal_dn, master_flat)
+    if sensitivity_map is not None:
+        signal_dn = apply_sensitivity_map(signal_dn, sensitivity_map)
     else:
         signal_dn = apply_prnu(signal_dn, prnu_std, rng, prnu_map=prnu_map)
 
@@ -276,10 +276,10 @@ def add_common_arguments(parser):
     """Arguments shared with batch_transform.py."""
     parser.add_argument("--sensor-profile", type=Path, default=Path(DEFAULT_PROFILE),
                         help=f"Sensor profile JSON (default: {DEFAULT_PROFILE}).")
-    parser.add_argument("--master-flat", type=Path, help="Master flat .npy from make_masters.py.")
+    parser.add_argument("--sensitivity-map", type=Path, help="Sensitivity map .npy from make_masters.py.")
     parser.add_argument("--master-dark", type=Path, help="Master dark .npy from make_masters.py.")
     parser.add_argument("--prnu-std", type=float,
-                        help="Synthetic PRNU standard deviation, used instead of --master-flat.")
+                        help="Synthetic PRNU standard deviation, used instead of --sensitivity-map.")
     parser.add_argument("--dsnu-std", type=float,
                         help="Synthetic DSNU standard deviation in DN, used instead of --master-dark.")
     parser.add_argument("--seed", type=int, help="Random seed (default: the profile's).")
@@ -287,18 +287,18 @@ def add_common_arguments(parser):
 
 
 def resolve_sources(args):
-    """Master frames are the expected input; synthetic values must be explicit."""
-    if (args.master_flat is None) == (args.prnu_std is None):
+    """Calibration maps are the expected input; synthetic values must be explicit."""
+    if (args.sensitivity_map is None) == (args.prnu_std is None):
         raise SystemExit(
-            "error: give exactly one of --master-flat or --prnu-std.\n"
-            "  --master-flat is the normal path; --prnu-std substitutes a synthetic gain map."
+            "error: give exactly one of --sensitivity-map or --prnu-std.\n"
+            "  --sensitivity-map is the normal path; --prnu-std substitutes a synthetic gain map."
         )
     if (args.master_dark is None) == (args.dsnu_std is None):
         raise SystemExit(
             "error: give exactly one of --master-dark or --dsnu-std.\n"
             "  --master-dark is the normal path; --dsnu-std substitutes a synthetic offset."
         )
-    for path in (args.master_flat, args.master_dark, args.sensor_profile):
+    for path in (args.sensitivity_map, args.master_dark, args.sensor_profile):
         if path is not None and not path.exists():
             raise SystemExit(f"error: {path} not found.")
 
@@ -318,14 +318,14 @@ def main():
 
     try:
         profile = SensorProfile.load(args.sensor_profile)
-        master_flat, master_dark = load_masters(profile, args.master_flat, args.master_dark)
+        sensitivity_map, master_dark = load_calibration(profile, args.sensitivity_map, args.master_dark)
     except ValueError as exc:
         raise SystemExit(f"error: {exc}")
     rng = np.random.default_rng(args.seed if args.seed is not None else profile.seed)
 
     out = transform_render(
         args.input, profile, rng,
-        master_flat=master_flat, master_dark=master_dark,
+        sensitivity_map=sensitivity_map, master_dark=master_dark,
         prnu_std=args.prnu_std, dsnu_std=args.dsnu_std,
     )
     save_image(out, args.output)

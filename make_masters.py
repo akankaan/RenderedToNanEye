@@ -1,4 +1,9 @@
-"""Build master dark and flat frames from folders of calibration captures."""
+"""Build a master dark and a sensitivity map from folders of calibration captures.
+
+Two outputs: master_dark.npy (additive offset in DN) and sensitivity_map.npy
+(the averaged flats with the master dark subtracted, then peak-normalized into a
+unitless per-pixel gain). The plain averaged flat is an intermediate and is not saved.
+"""
 import argparse
 from pathlib import Path
 
@@ -36,33 +41,29 @@ def compute_master_image(image_paths, method="mean"):
 PEAK_PERCENTILE = 99.5
 
 
-def normalize_flat(flat_image, peak_percentile=PEAK_PERCENTILE):
+def normalize_to_peak(image, peak_percentile=PEAK_PERCENTILE):
     # Normalize by the peak, not the mean because the gain map is applied by multiplying
     # a render, so the best-responding pixel should sit at 1.0 and the rest smaller than 1.
     # Dividing by the mean works when one divides by a flat to correct
     # an image. In this case, it amplifies the center and causes saturation.
     # Will use 99.5th percentile rather than the max, so small inconsistencies cannot change
     # the frame's scale.
-    peak = float(np.percentile(flat_image, peak_percentile))
+    peak = float(np.percentile(image, peak_percentile))
     if peak <= 0:
         raise ValueError("Flat-field image has a non-positive peak and cannot be normalized.")
-    return flat_image / peak
+    return image / peak
 
 
 def save_npy(image, output_path):
     np.save(output_path, image)
 
 
-def save_png(image, output_path):
-    image = np.asarray(image, dtype=np.float32)
-    min_val = float(np.min(image))
-    max_val = float(np.max(image))
-    if max_val > min_val:
-        image = (image - min_val) / (max_val - min_val)
-    else:
-        image = np.zeros_like(image, dtype=np.float32)
-    image = np.round(image * 65535.0).astype(np.uint16)
-    Image.fromarray(image, mode="I;16").save(output_path)
+def save_png(image, output_path, display_white):
+    # True-brightness 8-bit preview: map [0, display_white] to [0, 255] with no per-image
+    # stretch. A per-image min-max stretch would blow a near-uniform dark's tiny spread
+    # across the full range and make it look like dramatic speckle it does not have.
+    disp = np.clip(np.asarray(image, dtype=np.float32) / display_white, 0.0, 1.0)
+    Image.fromarray(np.round(disp * 255.0).astype(np.uint8)).save(output_path)
 
 
 def make_master_dark(
@@ -81,11 +82,11 @@ def make_master_dark(
     master_dark = (master_dark * (full_scale_dn / source_white_level)).astype(np.float32)
 
     save_npy(master_dark, output_base.with_suffix(".npy"))
-    save_png(master_dark, output_base.with_suffix(".png"))
+    save_png(master_dark, output_base.with_suffix(".png"), display_white=full_scale_dn)
     return master_dark
 
 
-def make_master_flat(
+def make_sensitivity_map(
     flat_folder,
     output_base,
     method,
@@ -98,31 +99,36 @@ def make_master_flat(
     if not flat_paths:
         raise ValueError(f"No flat frames found in '{flat_folder}'.")
 
-    master_flat = compute_master_image(flat_paths, method=method)
+    sensitivity = compute_master_image(flat_paths, method=method)
     if master_dark is not None:
-        # Convert master flat to DN so it matches master dark before substraction
-        master_flat = master_flat * (full_scale_dn / source_white_level)
-        master_flat = np.clip(master_flat - master_dark, 1e-6, None)
+        # Convert averaged flat to DN so it matches master dark before subtraction
+        sensitivity = sensitivity * (full_scale_dn / source_white_level)
+        sensitivity = np.clip(sensitivity - master_dark, 1e-6, None)
 
     if normalize:
-        master_flat = normalize_flat(master_flat)
+        sensitivity = normalize_to_peak(sensitivity)
+        display_white = 1.0
+    elif master_dark is not None:
+        display_white = full_scale_dn
+    else:
+        display_white = source_white_level
 
-    save_npy(master_flat, output_base.with_suffix(".npy"))
-    save_png(master_flat, output_base.with_suffix(".png"))
-    return master_flat
+    save_npy(sensitivity, output_base.with_suffix(".npy"))
+    save_png(sensitivity, output_base.with_suffix(".png"), display_white=display_white)
+    return sensitivity
 
 
 def parse_arguments():
     parser = argparse.ArgumentParser(
-        description="Create master dark and master flat images from folders of dark and flat frames."
+        description="Build a master dark and a sensitivity map from folders of dark and flat frames."
     )
     parser.add_argument("--dark-folder", type=str, help="Folder containing dark frame images.")
     parser.add_argument("--flat-folder", type=str, help="Folder containing flat frame images.")
     parser.add_argument("--dark-output", type=str, default="master_dark", help="Base output name for the master dark files (no extension).")
-    parser.add_argument("--flat-output", type=str, default="master_flat", help="Base output name for the master flat files (no extension).")
+    parser.add_argument("--sensitivity-output", type=str, default="sensitivity_map", help="Base output name for the sensitivity map files (no extension).")
     parser.add_argument("--dark-method", choices=["mean", "median"], default="median", help="Combine dark frames using mean or median.")
     parser.add_argument("--flat-method", choices=["mean", "median"], default="mean", help="Combine flat frames using mean or median.")
-    parser.add_argument("--no-normalize-flat", action="store_true", help="Do not normalize the master flat by its mean.")
+    parser.add_argument("--no-normalize", action="store_true", help="Do not peak-normalize the sensitivity map (debugging).")
     parser.add_argument("--sensor-profile", type=Path, default=Path(DEFAULT_PROFILE),
                         help=f"Sensor profile JSON supplying full_scale_dn and source_white_level (default: {DEFAULT_PROFILE}).")
     return parser.parse_args()
@@ -157,30 +163,30 @@ def main():
         if master_dark is None:
             print(
                 "Warning: no --dark-folder given, so the dark pedestal stays in the "
-                "master flat and the gain map will understate the sensor response."
+                "sensitivity map and it will understate the sensor response."
             )
 
-        flat_base = Path(args.flat_output)
-        master_flat = make_master_flat(
+        sens_base = Path(args.sensitivity_output)
+        sensitivity = make_sensitivity_map(
             args.flat_folder,
-            flat_base,
+            sens_base,
             method=args.flat_method,
-            normalize=not args.no_normalize_flat,
+            normalize=not args.no_normalize,
             master_dark=master_dark,
             source_white_level=profile.source_white_level,
             full_scale_dn=profile.full_scale_dn,
         )
-        outputs["master_flat"] = {
-            "npy": str(flat_base.with_suffix(".npy")),
-            "png": str(flat_base.with_suffix(".png")),
-            "shape": master_flat.shape,
-            "dtype": str(master_flat.dtype),
-            "normalized": not args.no_normalize_flat,
+        outputs["sensitivity_map"] = {
+            "npy": str(sens_base.with_suffix(".npy")),
+            "png": str(sens_base.with_suffix(".png")),
+            "shape": sensitivity.shape,
+            "dtype": str(sensitivity.dtype),
+            "normalized": not args.no_normalize,
             "dark_subtracted": master_dark is not None,
         }
 
     if outputs:
-        print(f"Master files created (profile: {profile.name}, "
+        print(f"Files created (profile: {profile.name}, "
               f"{profile.source_white_level:.0f} -> {profile.full_scale_dn:.0f} DN):")
         for name, info in outputs.items():
             print(f"  {name}:")

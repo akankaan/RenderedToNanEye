@@ -39,7 +39,7 @@ def main():
 
     try:
         profile = sensor.SensorProfile.load(args.sensor_profile)
-        master_flat, master_dark = sensor.load_masters(profile, args.master_flat, args.master_dark)
+        sensitivity_map, master_dark = sensor.load_calibration(profile, args.sensitivity_map, args.master_dark)
     except ValueError as exc:
         raise SystemExit(f"error: {exc}")
     rng = np.random.default_rng(args.seed if args.seed is not None else profile.seed)
@@ -56,7 +56,7 @@ def main():
     for index, image_path in enumerate(image_paths, start=1):
         out = sensor.transform_render(
             image_path, profile, rng,
-            master_flat=master_flat, master_dark=master_dark,
+            sensitivity_map=sensitivity_map, master_dark=master_dark,
             prnu_std=args.prnu_std, dsnu_std=args.dsnu_std,
             prnu_map=prnu_map, dsnu_map=dsnu_map,
         )
