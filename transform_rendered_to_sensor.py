@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
-from PIL import Image, ImageFilter
+from PIL import Image
 
 DEFAULT_PROFILE = "sensor_profile.json"
 
@@ -27,6 +27,7 @@ class SensorProfile:
     height: int
     full_scale_dn: float
     source_white_level: float
+    conversion_gain_e_per_dn: float
     blur_radius: float
     seed: int
     read_noise_dn: float
@@ -54,6 +55,7 @@ class SensorProfile:
                 height=int(raw["height"]),
                 full_scale_dn=float(raw["full_scale_dn"]),
                 source_white_level=float(raw["source_white_level"]),
+                conversion_gain_e_per_dn=float(raw["conversion_gain_e_per_dn"]),
                 blur_radius=float(raw["blur_radius"]),
                 seed=int(raw["seed"]),
                 read_noise_dn=float(raw["read_noise_dn"]),
@@ -77,9 +79,14 @@ class SensorProfile:
 
 
 def load_image_linear(path):
-    # Load as grayscale 
-    img = Image.open(path).convert("L")
-    return np.array(img, dtype=np.float32) / 255.0
+    # Load as grayscale and keep whatever bit depth the render has
+    src = np.asarray(Image.open(path))
+    white = 65535.0 if src.dtype == np.uint16 else 255.0
+
+    gray = src.astype(np.float32)
+    if gray.ndim == 3:  # RGB(A)
+        gray = gray[..., :3] @ np.array([0.299, 0.587, 0.114], dtype=np.float32)
+    return gray / white
 
 
 def bilinear_interpolate(image, x, y):
@@ -122,16 +129,32 @@ def inverse_radtan_map(x_dist, y_dist, k1, k2, p1, p2, k3=0.0, iterations=8):
     return x, y
 
 
+def gaussian_blur(gray, radius):
+    # np blur, instead of PIL, for float support
+    if radius <= 0:
+        return gray
+
+    k = int(np.ceil(3 * radius))
+    taps = np.exp(-0.5 * (np.arange(-k, k + 1) / radius) ** 2)
+    taps /= taps.sum()
+
+    h, w = gray.shape
+    rows = np.pad(gray, ((0, 0), (k, k)), mode="edge")
+    blurred = sum(t * rows[:, i:i + w] for i, t in enumerate(taps))
+    cols = np.pad(blurred, ((k, k), (0, 0)), mode="edge")
+    return sum(t * cols[i:i + h, :] for i, t in enumerate(taps)).astype(np.float32)
+
+
 def apply_optics(gray, profile):
     # Blur, resample to the sensor's resolution, then distort
     if profile.fx_px <= 0 or profile.fy_px <= 0:
         raise ValueError("Intrinsics fx_px/fy_px must be positive.")
 
-    img = Image.fromarray((gray * 255).astype(np.uint8), mode="L")
-    img = img.filter(ImageFilter.GaussianBlur(radius=profile.blur_radius))
-    img = img.resize((profile.width, profile.height), Image.Resampling.BICUBIC)
+    gray = gaussian_blur(gray, profile.blur_radius)
 
-    gray = np.array(img, dtype=np.float32) / 255.0
+    img = Image.fromarray(gray).resize((profile.width, profile.height), Image.Resampling.BICUBIC)
+    gray = np.clip(np.asarray(img, dtype=np.float32), 0.0, 1.0)
+
     h, w = gray.shape
 
     y, x = np.indices((h, w), dtype=np.float32)
@@ -168,9 +191,11 @@ def apply_prnu(signal_dn, prnu_std, rng, prnu_map=None):
     return signal_dn * (1 + prnu_map)
 
 
-def apply_shot_noise(signal_dn, rng):
-    # Shot noise modeled by a Poisson distribution
-    return rng.poisson(np.clip(signal_dn, 0, None)).astype(np.float32)
+def apply_shot_noise(signal_dn, rng, conversion_gain_e_per_dn):
+    # Shot noise is Poisson in electrons so convert 
+    # to not assume one electron per DN
+    electrons = np.clip(signal_dn, 0, None) * conversion_gain_e_per_dn
+    return (rng.poisson(electrons) / conversion_gain_e_per_dn).astype(np.float32)
 
 
 def apply_dark_current(signal_dn, dsnu_std, rng, dark_current_mean=0.0, dsnu_map=None):
@@ -262,7 +287,7 @@ def transform_render(
 
     # Shot noise is photon noise, so it only applies to the signal
     # before the dark is added
-    signal_dn = apply_shot_noise(signal_dn, rng)
+    signal_dn = apply_shot_noise(signal_dn, rng, profile.conversion_gain_e_per_dn)
 
     if master_dark is not None:
         signal_dn = signal_dn + master_dark

@@ -1,6 +1,6 @@
 {
   "name": "cam1",
-  "notes": "Stereo rig camera 1. Captures are 8-bit stored in a 16-bit grayscale container, so source_white_level is 65535. Swap this file to model a different camera.",
+  "notes": "Captures are 8-bit in a 16-bit grayscale container, so source_white_level is 65535. Swap this file to model a different camera.",
 
   "width": 320,
   "height": 320,
@@ -8,11 +8,13 @@
   "full_scale_dn": 860.0,
   "source_white_level": 65535.0,
 
+  "conversion_gain_e_per_dn": 16.6,
+
   "blur_radius": 0.2,
   "seed": 42,
 
-  "read_noise_dn": 0.75,
-  "row_noise_std": 0.234,
+  "read_noise_dn": 1.26,
+  "row_noise_std": 0.29,
 
   "intrinsics": {
     "fx_px": 160.0,
